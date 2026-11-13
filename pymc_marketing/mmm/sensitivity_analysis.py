@@ -98,36 +98,24 @@ from pymc import Model
 from pytensor import function
 from xarray import DataArray
 
-from pymc_marketing.mmm.leased_cache import Lease
-from pymc_marketing.mmm.sweep_cache import SweepCache
-from pymc_marketing.mmm.sweep_graph import (
-    SWEEP_DIM,
-    SweepCacheKey,
-    SweepEntry,
-    compose_sweep,
-)
+from pymc_marketing.mmm.sweep_graph import SWEEP_DIM, compose_sweep
 from pymc_marketing.pytensor_utils import (
-    ModelCloneError,
+    SharedPosterior,
+    _raise_for_missing_posterior_variables,
     extract_response_distribution,
     needed_posterior_names,
-    reorder_to_model_coords,
+    posterior_in_model_coords,
 )
 
 
 class SensitivityAnalysis:
     """Run counterfactual sweeps over a fitted model's response.
 
-    The compiled-sweep cache belongs to the owning MMM when the instance comes
-    from :attr:`~pymc_marketing.mmm.mmm.MMM.sensitivity`: every access shares
-    one cache, one per model.
-    A separately constructed instance keeps a private cache.  The cache key
-    describes the sweep graph only; the source model is checked separately.
-    Replacing a data buffer with ``pm.set_data`` rebuilds the affected entry;
-    writing into a data buffer in place is not detected, the same as for the
-    incrementality evaluator, and neither is a change to the source model's
-    coords that leaves its buffers in place.  Rebuilding or refitting the model
-    clears the cache an :class:`~pymc_marketing.mmm.mmm.MMM` owns; a private
-    cache instead detects the new model and rebuilds its entries.
+    Every call extracts the response conditioned on the posterior draws, composes
+    the sweep graph and compiles it.  Nothing is kept between calls, so a repeat
+    call compiles again.  The draws are bound through a
+    :class:`~pymc_marketing.pytensor_utils.SharedPosterior`, which keeps them
+    shared variables of the compiled sweep instead of constants welded into it.
 
     ``dims`` is accepted for backwards compatibility and ignored: the response's
     own dims decide the output axes.
@@ -138,8 +126,6 @@ class SensitivityAnalysis:
         pymc_model: Model,
         idata: xr.DataTree,
         dims: tuple[str, ...] = (),
-        *,
-        _cache: SweepCache | None = None,
     ):
         """Initialize the analysis.
 
@@ -153,16 +139,10 @@ class SensitivityAnalysis:
             Accepted for backwards compatibility and ignored.  The response's
             own dims decide the output axes, so passing the model's extra dims
             here is harmless but unnecessary.
-        _cache : SweepCache, optional
-            Internal cache supplied by
-            :attr:`~pymc_marketing.mmm.mmm.MMM.sensitivity`.  Without one
-            the instance keeps a private cache, so repeated calls on the
-            instance compile once.
         """
         self.model = pymc_model
         self.idata = idata
         self.dims = dims
-        self._cache = SweepCache() if _cache is None else _cache
 
     def _draw_indices_for_percentage(
         self, posterior_sample_fraction: float
@@ -196,19 +176,28 @@ class SensitivityAnalysis:
     ):
         """Extract the response graph conditioned on draws in the model's order.
 
-        :class:`~pymc_marketing.pytensor_utils.ConditionedModel` realigns every
-        posterior to the model's coords by label; the per-call path does the
-        same here so a label-permuted posterior gives the cached path's
-        numbers.  Renamed or unlabeled coords keep their given order and are
-        read by position.
+        The draws are realigned to the model's coords by label, so a
+        label-permuted posterior gives the numbers the model's own label order
+        gives; renamed or unlabeled coords keep their order and are read by
+        position.
+
+        A fresh :class:`~pymc_marketing.pytensor_utils.SharedPosterior` binds the
+        draws as shared variables, as
+        :class:`~pymc_marketing.pytensor_utils.ConditionedModel` does, instead of
+        baking them into the graph as constants.  The object is not kept after
+        the call: it exists so the extracted graph reads shared draws, which
+        keeps the compiled sweep small.
         """
-        posterior = reorder_to_model_coords(
-            idata["/posterior"].to_dataset(), self.model.coords
+        posterior = posterior_in_model_coords(idata, self.model.coords)
+        _raise_for_missing_posterior_variables(
+            needed_posterior_names(self.model, [self.model[response_variable]]),
+            posterior,
         )
         return extract_response_distribution(
             pymc_model=self.model,
             idata=posterior,
             response_variable=response_variable,
+            shared_posterior=SharedPosterior(),
         )
 
     def _prepare_response_mask(
@@ -298,16 +287,17 @@ class SensitivityAnalysis:
     ) -> xr.DataTree:
         """Return the posterior the sweep reads, narrowed to the retained draws.
 
-        A cache entry keeps the posterior it was built on, so handing it the
-        whole tree would pin every group and every variable for as long as the
-        entry lives.  Only the posterior variables the response graph reads are
-        kept, and only the ``posterior`` group: the sweep reads nothing else.
+        Only the posterior variables the response graph reads are kept, and only
+        the ``posterior`` group: the sweep reads nothing else.  Each call binds
+        the draws as shared variables, and stacking a variable no graph reads
+        would copy its draws for nothing, so the narrowing keeps a call cheap
+        however many deterministics the posterior carries.
 
         A response that reads no posterior variable -- a pure function of
-        ``pm.Data`` -- keeps the whole tree, as it did before the narrowing,
-        because an empty posterior has no ``chain`` or ``draw`` dims to select.
-        So does a posterior that lacks a variable the response reads, so the
-        conditioned model reports the missing names itself.
+        ``pm.Data`` -- keeps the whole tree, because an empty posterior has no
+        ``chain`` or ``draw`` dims to select.  So does a posterior that lacks a
+        variable the response reads, so the extraction reports the missing name
+        itself.
         """
         draw_selection = self._draw_indices_for_percentage(posterior_sample_fraction)
         read_names = needed_posterior_names(self.model, [self.model[var_names]])
@@ -318,166 +308,28 @@ class SensitivityAnalysis:
         narrowed = xr.Dataset({name: posterior[name] for name in read_names})
         return xr.DataTree.from_dict({"/posterior": narrowed.isel(draw=draw_selection)})
 
-    def _sweep_key(
+    def _run_sweep_per_call(
         self,
         var_input: str,
         var_names: str,
         sweep_type: str,
-        mask_values: np.ndarray | None,
-    ) -> SweepCacheKey:
-        """Return the structure a compiled sweep is cached under."""
-        return SweepCacheKey(
-            var_input=var_input,
-            var_names=var_names,
-            sweep_type=sweep_type,
-            mask_shape=None if mask_values is None else tuple(mask_values.shape),
-        )
-
-    def _run_sweep_cached(
-        self,
-        key: SweepCacheKey,
         idata: xr.DataTree,
         sweep_values: np.ndarray,
         mask_values: np.ndarray | None,
     ) -> tuple[tuple[str, ...], np.ndarray]:
-        """Evaluate the sweep through the compiled sweep cache.
+        """Extract, compose and compile the sweep for this call.
 
-        The entry is leased for the duration of the call, so concurrent callers
-        on the same key build their own instead of rebinding each other's
-        draws.  Every call rebinds the entry to this call's draws, which covers
-        ``posterior_sample_fraction`` and a replaced ``mmm.idata``.  An entry
-        that cannot be rebound is replaced by one built for this call, and the
-        entry it replaces stays out of the cache until the replacement has
-        evaluated: only then is the replacement cached and the old entry
-        dropped.  A replacement that fails is dropped while the old entry goes
-        back, so one posterior the model cannot evaluate cannot empty the
-        cache.
-
-        A model :class:`~pymc_marketing.pytensor_utils.ConditionedModel` cannot
-        clone falls back to :meth:`_run_sweep_per_call`.  Only the clone step
-        falls back, so an error that is not a layout mismatch raised while
-        binding or evaluating an entry propagates.  An entry built for this
-        call that fails to evaluate is dropped before the error propagates; a
-        cached entry that fails stays cached, because the failure is about this
-        call's arguments.
+        The graph reads the source model's live data, so a ``pm.set_data``
+        between calls reaches the next sweep.  The draws are realigned to the
+        model's coords by label in :meth:`_extract_response_distribution`, so a
+        permuted posterior gives the model's label order numbers; renamed or
+        unlabeled coords are read by position.
         """
-        lease, retired = self._lease_bound_to(key, idata)
-        if lease is None:
-            return self._run_sweep_per_call(key, idata, sweep_values, mask_values)
-        try:
-            result = (
-                lease.value.output_dims,
-                lease.value.evaluate(sweep_values, mask_values),
-            )
-        except BaseException:
-            if retired is not None:
-                retired.release()
-            if not lease.cached:
-                lease.discard()
-            raise
-        else:
-            if retired is not None:
-                retired.discard()
-            return result
-        finally:
-            lease.release()
-            if retired is not None:
-                retired.release()
-
-    def _lease(
-        self, key: SweepCacheKey, idata: xr.DataTree
-    ) -> Lease[SweepEntry] | None:
-        """Lease an entry for this call, or ``None`` if the model cannot be cloned.
-
-        ``None`` means the per-call path handles the question.  The cache
-        remembers an unclonable model, so the clone is attempted once per
-        model rather than once per call.
-        """
-        try:
-            return self._cache.lease(
-                key, self.model, lambda: SweepEntry.build(self.model, idata, key)
-            )
-        except ModelCloneError:
-            return None
-
-    def _rebuild(
-        self, key: SweepCacheKey, idata: xr.DataTree
-    ) -> Lease[SweepEntry] | None:
-        """Build this call's entry, or ``None`` if the model cannot be cloned.
-
-        The entry is conditioned on ``idata`` when it is built, so it never
-        needs a rebind and whatever the cache holds in the meantime is not
-        consulted.
-        """
-        try:
-            return self._cache.rebuild(
-                key, self.model, lambda: SweepEntry.build(self.model, idata, key)
-            )
-        except ModelCloneError:
-            return None
-
-    def _lease_bound_to(
-        self, key: SweepCacheKey, idata: xr.DataTree
-    ) -> tuple[Lease[SweepEntry] | None, Lease[SweepEntry] | None]:
-        """Lease an entry whose graphs read the draws in ``idata``.
-
-        Returns the lease to evaluate and, when a cached entry had to be
-        replaced, the lease it retires.  The caller drops the retired entry once
-        the replacement has evaluated and puts it back if the replacement does
-        not, so one bad posterior cannot empty the cache.
-
-        A cached entry that cannot be rebound was built on another posterior
-        layout -- renamed or unlabeled coords, another dim set, or labels
-        reordered -- which an empty cache would accept.  This call's entry is
-        built in its place, without consulting the cache again; a rebuild that
-        raises leaves the retired entry untouched, and one that cannot clone the
-        model discards it and sends the call to the per-call path.  Both leases
-        are ``None`` when the model cannot be cloned.
-        """
-        lease = self._lease(key, idata)
-        if lease is None or not lease.cached:
-            return lease, None
-        try:
-            lease.value.set_posterior(idata)
-        except ValueError:
-            try:
-                replacement = self._rebuild(key, idata)
-            except BaseException:
-                # The rebind is atomic, so the entry is untouched and still
-                # good for the next call.
-                lease.release()
-                raise
-            if replacement is None:
-                lease.discard()
-                return None, None
-            return replacement, lease
-        except BaseException:
-            # Any other failure leaves the atomic rebind untouched, so the
-            # entry is still good for the next call.
-            lease.release()
-            raise
-        return lease, None
-
-    def _run_sweep_per_call(
-        self,
-        key: SweepCacheKey,
-        idata: xr.DataTree,
-        sweep_values: np.ndarray,
-        mask_values: np.ndarray | None,
-    ) -> tuple[tuple[str, ...], np.ndarray]:
-        """Extract, compose and compile the sweep on every call.
-
-        This is the path for models :class:`ConditionedModel` cannot clone, and
-        it reads the source model's live data, as every call did before the
-        cache existed.  The draws are realigned to the model's coords by label,
-        as the cached path does, so a permuted posterior gives the same
-        numbers; renamed or unlabeled coords are read by position.
-        """
-        response = self._extract_response_distribution(key.var_names, idata)
+        response = self._extract_response_distribution(var_names, idata)
         inputs, graph = compose_sweep(
             response=response,
-            base_value=self.model[key.var_input],
-            sweep_type=key.sweep_type,
+            base_value=self.model[var_input],
+            sweep_type=sweep_type,
             has_mask=mask_values is not None,
             mask_shape=None if mask_values is None else mask_values.shape,
         )
@@ -523,14 +375,10 @@ class SensitivityAnalysis:
         """
         Run sweeps by forward-evaluating the response graph (no Jacobian).
 
-        Repeated calls on the same structure reuse a compiled sweep from this
-        instance's cache.  On an instance reached through ``mmm.sensitivity``
-        that cache belongs to the MMM and is shared by every access, one cache
-        per model; the model is not part of the key.  Only the sweep values,
-        the mask values and the posterior draws change between calls, and those
-        are a function argument or a posterior rebind, so a repeat call does not
-        compile unless the posterior layout changed, which rebuilds the entry
-        once.
+        Every call extracts the response conditioned on the posterior draws,
+        composes the sweep graph and compiles it, so ``sweep_values``,
+        ``response_mask`` and the posterior are inputs of that call rather than
+        state kept between calls.
 
         Parameters
         ----------
@@ -584,8 +432,7 @@ class SensitivityAnalysis:
         assigning ``mmm.idata``.  A posterior stored in another order of the
         model's own labels is realigned by label; renamed or unlabeled coords are
         bound by position.  The number of draws may change, and values are cast
-        to the dtype the model expects.  A call answers what an empty cache
-        would answer, whether or not it reuses a compiled sweep.
+        to the dtype the model expects.
         """
         response = self.model[var_names]
         response_dims = getattr(response, "dims", None)
@@ -611,9 +458,9 @@ class SensitivityAnalysis:
                 response_mask, response_dims, var_names=var_names
             )
         )
-        key = self._sweep_key(var_input, var_names, sweep_type, mask_values)
-
-        dims, result = self._run_sweep_cached(key, idata, sweep_values, mask_values)
+        dims, result = self._run_sweep_per_call(
+            var_input, var_names, sweep_type, idata, sweep_values, mask_values
+        )
         xr_result = self._sweep_dataarray(dims, result, sweep_values)
 
         if extend_idata:

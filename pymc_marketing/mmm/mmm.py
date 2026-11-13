@@ -260,7 +260,6 @@ from pymc_marketing.mmm.scaling import (
 )
 from pymc_marketing.mmm.sensitivity_analysis import SensitivityAnalysis
 from pymc_marketing.mmm.spend_reach import _PKG_PREFIX
-from pymc_marketing.mmm.sweep_cache import SweepCache
 from pymc_marketing.mmm.tvp import create_hsgp_from_config, infer_time_index
 from pymc_marketing.mmm.utility import UtilityFunctionType, average_response
 from pymc_marketing.mmm.utils import (
@@ -465,12 +464,6 @@ def _parse_cost_per_target_records(
 
 _EVALUATOR_CACHE_ATTR = "_incrementality_evaluators"
 """Instance attribute holding the compiled incrementality evaluators of an MMM.
-
-Not the accessor's own name, which the stored cache would shadow.
-"""
-
-_SWEEP_CACHE_ATTR = "_sensitivity_sweeps"
-"""Instance attribute holding the compiled sensitivity sweeps of an MMM.
 
 Not the accessor's own name, which the stored cache would shadow.
 """
@@ -2712,12 +2705,9 @@ class MMM(RegressionModelBuilder):
         in the ``cost_per_target_spend`` group, one variable per distinct spend
         array. :meth:`build_from_idata` replays them when the model is loaded.
         """
-        # A refit replaces the posterior.  Both caches are dropped so nothing
-        # built on the previous fit stays alive.  A sweep would rebind or rebuild
-        # against the new posterior anyway, so for sweeps this only frees the
-        # compiled functions and the draws of the previous fit.
+        # A refit replaces the posterior and can move its coordinate labels, which
+        # the evaluator's shared binding would refuse; build against it from scratch.
         self._clear_incrementality_evaluator_cache()
-        self._clear_sensitivity_sweep_cache()
         if hasattr(self, "model") and self._target_is_placeholder:
             warnings.warn(
                 "The model was built by `sample_prior_predictive` with a "
@@ -2854,11 +2844,8 @@ class MMM(RegressionModelBuilder):
             )
 
         """
-        # A rebuild replaces the graph every compiled evaluator was built from.
-        # A sweep entry would detect the new model and rebuild against it, so it is
-        # dropped only to free its compiled function and the old model's buffers.
+        # A rebuild replaces the graph every compiled incrementality evaluator was built from, so none is reusable.
         self._clear_incrementality_evaluator_cache()
-        self._clear_sensitivity_sweep_cache()
         # Calibration rows belong to a particular graph. A rebuild creates a
         # fresh graph, so callers must re-add any lift tests they want to use.
         self._lift_test_calibrations = []
@@ -4243,24 +4230,12 @@ class MMM(RegressionModelBuilder):
                 sweep_type="multiplicative",
             )
 
-        Repeated sweeps on the same model reuse compiled work, so only the first
-        call for a given ``var_input``, ``var_names``, ``sweep_type`` and mask
-        shape pays the compilation cost.  The cache belongs to this MMM: every
-        access shares it, one cache per model, and the model is not part of the
-        key.  Replacing a data buffer with ``pm.set_data`` rebuilds the
-        affected entry; writing into a data buffer in place is not detected,
-        the same as for the incrementality evaluator, and neither is a change to
-        the model's coords that leaves its buffers in place.  A model that cannot be
-        cloned compiles on every call.  Rebuilding or refitting the model
-        drops that cache.
-
         """
         # Provide the underlying PyMC model, the model's inference data, and dims
         return SensitivityAnalysis(
             pymc_model=self.model,
             idata=self.idata,
             dims=self.dims,
-            _cache=self._sensitivity_sweep_cache(),
         )
 
     @property
@@ -4294,9 +4269,8 @@ class MMM(RegressionModelBuilder):
         """Return the cache of compiled incrementality evaluators, creating it on first use.
 
         Every :class:`~pymc_marketing.mmm.incrementality.Incrementality` built on
-        this model shares it.  The cache pickles and copies as an empty cache, so it
-        starts empty on a deep copy (a shallow copy shares it, as it shares the
-        PyMC model), and
+        this model shares it.  It is never serialized, starts empty on a deep
+        copy (a shallow copy shares it, as it shares the PyMC model), and
         :meth:`_clear_incrementality_evaluator_cache` drops it.  Creation
         goes through ``dict.setdefault``, so two threads making the first call
         at once still share one cache.
@@ -4313,31 +4287,6 @@ class MMM(RegressionModelBuilder):
         A later incrementality call then compiles a fresh evaluator.
         """
         self.__dict__.pop(_EVALUATOR_CACHE_ATTR, None)
-
-    def _sensitivity_sweep_cache(self) -> SweepCache:
-        """Return the cache of compiled sensitivity sweeps, creating it on first use.
-
-        Every :class:`~pymc_marketing.mmm.sensitivity_analysis.SensitivityAnalysis`
-        built on this model shares it.  The cache pickles and copies as an empty
-        cache, so it starts empty on a deep copy of the MMM (a shallow copy shares
-        it, as it shares the PyMC model), and :meth:`_clear_sensitivity_sweep_cache` drops it.
-        Creation goes through ``dict.setdefault``, so two threads making the
-        first call at once still share one cache.
-        """
-        cache = self.__dict__.get(_SWEEP_CACHE_ATTR)
-        if cache is None:
-            cache = self.__dict__.setdefault(_SWEEP_CACHE_ATTR, SweepCache())
-        return cache
-
-    def _clear_sensitivity_sweep_cache(self) -> None:
-        """Drop every compiled sensitivity sweep.
-
-        Correctness does not depend on this: an entry detects a rebuilt model and
-        rebuilds against it, and a refit's changed posterior is rebound or makes the
-        entry rebuild.  Dropping the cache frees the compiled functions and the
-        draws of the previous fit; a later sensitivity call compiles a fresh sweep.
-        """
-        self.__dict__.pop(_SWEEP_CACHE_ATTR, None)
 
     def _make_channel_transform(
         self, df_lift_test: pd.DataFrame
@@ -5289,12 +5238,6 @@ class MMM(RegressionModelBuilder):
             mmm.build_from_idata(idata)
 
         """
-        # The rebuild below replaces the model graph every compiled evaluator was
-        # built from.  A sweep would rebuild against the new model; both caches are
-        # cleared up front so a failure before the rebuild cannot leave them behind
-        # (build_model clears both again).
-        self._clear_incrementality_evaluator_cache()
-        self._clear_sensitivity_sweep_cache()
         self.idata = idata
         if "mu_effects" in idata.attrs:
             mu_effects_data = json.loads(idata.attrs["mu_effects"])

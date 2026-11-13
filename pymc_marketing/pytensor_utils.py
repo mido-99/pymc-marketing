@@ -630,9 +630,7 @@ def posterior_in_model_coords(
 
     This is the one place a posterior is taken out of ``idata`` and realigned,
     so every consumer reads the same coordinates:
-    :class:`ConditionedModel` on construction and on every rebind, and a
-    :class:`~pymc_marketing.mmm.sweep_graph.SweepEntry` when it checks that the
-    draws it is rebound to carry the labels it was built on.
+    :class:`ConditionedModel` on construction and on every rebind.
 
     Parameters
     ----------

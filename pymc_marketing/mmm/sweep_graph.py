@@ -12,57 +12,32 @@
 #   See the License for the specific language governing permissions and
 #   limitations under the License.
 
-"""The compiled sweep graph and the structure it is keyed by.
+"""The compiled sweep graph.
 
-A sweep grid is a function argument, so one compiled function serves every grid
-of a given structure.  :class:`SweepCacheKey` names that structure and
-:class:`SweepEntry` owns the compiled function and the model clone it reads.
-The cache that stores entries lives in :mod:`pymc_marketing.mmm.sweep_cache`;
-this module holds no cache state.
+The sweep grid is a symbolic input, so the graph's structure depends on the
+response graph, the input it replaces and the sweep type, not on the grid's
+values.  :func:`compose_sweep` builds the symbolic inputs and graph, and
+:class:`~pymc_marketing.mmm.sensitivity_analysis.SensitivityAnalysis` compiles
+them for one call.
 """
 
 from __future__ import annotations
 
-from collections.abc import Callable
-from typing import NamedTuple
-
-import numpy as np
 import pytensor.tensor as pt
 import pytensor.xtensor as ptx
-import xarray as xr
-from pymc import Model
-from pytensor import function
 from pytensor.graph.basic import Variable
 from pytensor.tensor import TensorVariable
 from pytensor.xtensor.type import XTensorVariable, as_xtensor
 from pytensor.xtensor.vectorization import vectorize_graph
 
-from pymc_marketing.mmm.source_buffers import buffers_replaced, watched_source_buffers
-from pymc_marketing.pytensor_utils import ConditionedModel, posterior_in_model_coords
-
 SWEEP_DIM = "sweep"
 """Name of the dimension the sweep grid is vectorized over."""
 
 SWEEP_NAME = "sweep"
-"""Name of the symbolic sweep input every compiled entry takes."""
+"""Name of the symbolic sweep input every compiled sweep takes."""
 
 MASK_NAME = "mask"
-"""Name of the symbolic response-mask input an entry with a mask takes."""
-
-
-class SweepCacheKey(NamedTuple):
-    """Structure of a sweep question, which is what a compiled entry is keyed by.
-
-    The sweep values and the mask values are function arguments, so they are
-    not part of the key: a new grid or a new mask only recompiles when it
-    changes the shape of the graph.  The source model is checked separately
-    because a cache belongs to one model.
-    """
-
-    var_input: str
-    var_names: str
-    sweep_type: str
-    mask_shape: tuple[int, ...] | None
+"""Name of the symbolic response-mask input a masked sweep takes."""
 
 
 def apply_response_mask(
@@ -102,7 +77,7 @@ def build_sweep_response(
     Parameters
     ----------
     base_value : XTensorVariable
-        The input the sweep replaces; the clone's own input in a cached entry.
+        The input the sweep replaces: the source model's live input.
     response : XTensorVariable
         The extracted response graph, already masked when a mask is used.
     sweep : XTensorVariable
@@ -144,9 +119,8 @@ def compose_sweep(
 ) -> tuple[list[Variable], XTensorVariable]:
     """Compose the symbolic inputs and graph of one compiled sweep.
 
-    The cached and the per-call path build the same graph here and differ only
-    in where ``response`` and ``base_value`` come from: the clone's own input in
-    a cached entry, the source model's in the per-call path.
+    The response graph and the input it replaces come from the source model, so
+    the sweep a call compiles reads that model's live data.
 
     Parameters
     ----------
@@ -183,200 +157,3 @@ def compose_sweep(
         response = apply_response_mask(response, mask)
         inputs.append(mask)
     return inputs, build_sweep_response(base_value, response, sweep, sweep_type)
-
-
-class SweepEntry:
-    """One compiled sweep graph, conditioned on its own clone of the model.
-
-    The entry holds the clone, so a rebind cannot touch another entry's draws.
-    It also records whether the compiled function takes a response mask
-    alongside the sweep grid.  The sweep values and the mask values stay plain
-    function arguments.
-
-    Parameters
-    ----------
-    source_model : Model
-        The model the clone was taken from.
-    conditioned : ConditionedModel
-        The clone, which owns the posterior binding of the compiled function.
-    compiled : callable
-        The compiled sweep function, taking the sweep grid and, when present,
-        the mask.
-    has_mask : bool
-        Whether the compiled function takes the symbolic mask as its second
-        argument.
-    output_dims : tuple of str
-        Dimension order of the compiled output.
-    watched_buffers : dict of str to np.ndarray
-        The source data buffers the compiled graph reads.
-    """
-
-    def __init__(
-        self,
-        *,
-        source_model: Model,
-        conditioned: ConditionedModel,
-        compiled: Callable,
-        has_mask: bool,
-        output_dims: tuple[str, ...],
-        watched_buffers: dict[str, np.ndarray],
-    ) -> None:
-        self._source_model = source_model
-        self._conditioned = conditioned
-        self._compiled: Callable[..., np.ndarray] = compiled
-        self.has_mask = has_mask
-        self.output_dims = output_dims
-        self._watched_buffers = watched_buffers
-        # The labels each read variable was built on, by dimension.  A rebind
-        # must land on these, not merely on the same set of labels: realigning
-        # a permutation of them would read the new draws by position while an
-        # entry built on them read by position too, and the two orders differ.
-        self._built_on_labels = {
-            name: {
-                str(dim): index
-                for dim, index in conditioned.posterior[name].indexes.items()
-                if dim not in ("chain", "draw")
-            }
-            for name in conditioned.shared_posterior.variables
-        }
-
-    @classmethod
-    def build(
-        cls, model: Model, idata: xr.DataTree | xr.Dataset, key: SweepCacheKey
-    ) -> SweepEntry:
-        """Clone ``model``, compose the sweep graph for ``key`` and compile it.
-
-        The graph is built on the clone's own input, because an input of the
-        source model is refused by
-        :meth:`~pymc_marketing.pytensor_utils.ConditionedModel.extract`.
-
-        Parameters
-        ----------
-        model : Model
-            The source model, cloned here and never modified.
-        idata : xr.DataTree or xr.Dataset
-            Posterior draws the clone is conditioned on.
-        key : SweepCacheKey
-            The structure of the sweep to build.
-
-        Returns
-        -------
-        SweepEntry
-            The compiled entry.
-
-        Raises
-        ------
-        ModelCloneError
-            If PyMC cannot clone ``model``, as for a model with custom initial
-            values or a nested sub-model.  The caller falls back to compiling
-            per call, which raises any error that was really about ``idata``.
-        """
-        conditioned = ConditionedModel(model, idata)
-        response = conditioned.extract(key.var_names)
-        base_value: XTensorVariable = conditioned.model[key.var_input]
-        has_mask = key.mask_shape is not None
-        inputs, graph = compose_sweep(
-            response=response,
-            base_value=base_value,
-            sweep_type=key.sweep_type,
-            has_mask=has_mask,
-            mask_shape=key.mask_shape,
-        )
-        return cls(
-            source_model=model,
-            conditioned=conditioned,
-            compiled=function(inputs, graph),
-            has_mask=has_mask,
-            output_dims=graph.dims,
-            watched_buffers=watched_source_buffers(model, [graph]),
-        )
-
-    def is_stale(self, source_model: Model) -> bool:
-        """Whether the entry no longer matches the model data it was built on.
-
-        Each watched variable costs one borrowed-buffer identity check and no
-        value comparison.  ``pm.set_data`` replaces the buffer, which is what
-        this sees; an in-place write to the buffer itself is not detected.  A
-        buffer replaced by equal values still counts as a change, and so does a
-        different source model.
-
-        Parameters
-        ----------
-        source_model : Model
-            The model a call is about to use.
-
-        Returns
-        -------
-        bool
-            ``True`` when the entry must be rebuilt rather than leased.
-        """
-        if source_model is not self._source_model:
-            return True
-        return buffers_replaced(self._source_model, self._watched_buffers)
-
-    def set_posterior(self, idata: xr.DataTree | xr.Dataset) -> None:
-        """Rebind the compiled function to the draws in ``idata``.
-
-        The shared draws are swapped in place, so the number of draws may
-        change and the function is not recompiled.  Everything the graphs read
-        is validated against the construction layout, with coordinates
-        realigned by label, and each variable must keep the labels this entry
-        was built on.  A posterior whose labels are renamed, reordered or
-        dropped on one side is refused rather than bound by position, so the
-        caller rebuilds and answers what an empty cache would.
-
-        Parameters
-        ----------
-        idata : xr.DataTree or xr.Dataset
-            The posterior draws to evaluate under.
-
-        Raises
-        ------
-        KeyError
-            If the posterior lacks a variable the compiled graph reads.
-        ValueError
-            If a variable the compiled graph reads differs in its non-sample
-            dimensions, their lengths or their labels from the ones this entry
-            was built on.
-        """
-        posterior = posterior_in_model_coords(idata, self._conditioned.model.coords)
-        self._raise_if_relabelled(posterior)
-        self._conditioned.set_posterior(posterior)
-
-    def _raise_if_relabelled(self, posterior: xr.Dataset) -> None:
-        """Refuse a posterior that reorders or renames a label of a read variable.
-
-        A variable missing from ``posterior`` is skipped, so
-        :meth:`ConditionedModel.set_posterior` reports it in its own words.
-        """
-        for name, built_on in self._built_on_labels.items():
-            if name not in posterior.data_vars:
-                continue
-            for dim, labels in built_on.items():
-                given = posterior[name].indexes.get(dim)
-                if given is not None and not given.equals(labels):
-                    raise ValueError(
-                        f"Posterior variable {name!r}: dimension {dim!r} labels "
-                        "differ from the ones this entry was built on."
-                    )
-
-    def evaluate(
-        self, sweep_values: np.ndarray, mask_values: np.ndarray | None
-    ) -> np.ndarray:
-        """Evaluate the compiled sweep under the currently bound posterior.
-
-        Parameters
-        ----------
-        sweep_values : np.ndarray
-            The sweep grid, a function argument so no recompile is needed.
-        mask_values : np.ndarray or None
-            The response mask, passed only when the entry was built with one.
-
-        Returns
-        -------
-        np.ndarray
-            The sweep result, with the entry's ``output_dims`` layout.
-        """
-        if not self.has_mask:
-            return self._compiled(sweep_values)
-        return self._compiled(sweep_values, mask_values)
