@@ -3535,6 +3535,7 @@ class MMMPlotSuite:
                 sweep_values=sweeps,
                 var_names="channel_contribution",
                 sweep_type="multiplicative",
+                extend_idata=True,
             )
             uplift = sa.compute_uplift_curve_respect_to_base(
                 results, ref=1.0, extend_idata=True
@@ -3636,6 +3637,7 @@ class MMMPlotSuite:
                 sweep_values=sweeps,
                 var_names="channel_contribution",
                 sweep_type="multiplicative",
+                extend_idata=True,
             )
             me = sa.compute_marginal_effects(results, extend_idata=True)
             _ = mmm.plot.marginal_curve(hdi_prob=0.9)
