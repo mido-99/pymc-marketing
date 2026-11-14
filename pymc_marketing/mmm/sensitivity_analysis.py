@@ -97,9 +97,10 @@ import numpy as np
 import xarray as xr
 from pymc import Model
 from pytensor import function
+from pytensor.xtensor.type import XTensorVariable
 from xarray import DataArray
 
-from pymc_marketing.mmm.sweep_graph import SWEEP_DIM, compose_sweep
+from pymc_marketing.mmm.sweep_graph import compose_sweep
 from pymc_marketing.names.mmm import Dim, Group, Var
 from pymc_marketing.pytensor_utils import (
     SharedPosterior,
@@ -144,23 +145,7 @@ class SensitivityAnalysis:
         dims: tuple[str, ...] = (),
         frozen_deterministics: Sequence[str] = (),
     ) -> None:
-        """Initialize the analysis.
-
-        Parameters
-        ----------
-        pymc_model : Model
-            The model whose response is swept.
-        idata : xr.DataTree
-            Fitted inference data holding the posterior draws.
-        dims : tuple of str, default ()
-            Accepted for backwards compatibility and ignored.  The response's
-            own dims decide the output axes, so passing the model's extra dims
-            here is harmless but unnecessary.
-        frozen_deterministics : sequence of str, default ()
-            Deterministics taken from the posterior rather than recomputed, such
-            as a latent path over the dates the model was fitted on.  A sweep
-            keeps those dates, so their posterior draws hold in every sweep.
-        """
+        """Initialize the analysis; the parameters are documented on the class."""
         self.model = pymc_model
         self.idata = idata
         self.dims = dims
@@ -195,7 +180,7 @@ class SensitivityAnalysis:
 
     def _extract_response_distribution(
         self, response_variable: str, idata: xr.DataTree
-    ):
+    ) -> XTensorVariable:
         """Extract the response graph conditioned on draws in the model's order.
 
         The draws are realigned to the model's coords by label, so a
@@ -376,7 +361,7 @@ class SensitivityAnalysis:
         """Label the compiled output with the sweep grid and the model coords."""
         coords = {}
         for dim, shape in zip(dims, result.shape, strict=True):
-            if dim == SWEEP_DIM:
+            if dim == Dim.SWEEP:
                 dim_coords = np.asarray(sweep_values)
             else:
                 dim_coords = self.model.coords.get(dim)
@@ -580,7 +565,7 @@ class SensitivityAnalysis:
             ``sensitivity_analysis`` group yet; ``run_sweep(...,
             extend_idata=True)`` creates it.
         """
-        xr_result = results.differentiate(coord=SWEEP_DIM)
+        xr_result = results.differentiate(coord=Dim.SWEEP)
         if extend_idata:
             if not hasattr(self.idata, Group.SENSITIVITY_ANALYSIS):
                 raise ValueError(

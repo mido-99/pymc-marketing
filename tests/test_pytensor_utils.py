@@ -2865,7 +2865,7 @@ def test_conditioned_model_intervention_error_on_a_clonable_model_is_not_a_clone
     """An error about the intervention keeps its own type, not ModelCloneError."""
     model, _ = _channel_conditioned_model()
 
-    with pytest.raises(Exception) as excinfo:
+    with pytest.raises(KeyError) as excinfo:
         ConditionedModel(
             model,
             _channel_posterior([1.0, 2.0]),

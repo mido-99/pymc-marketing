@@ -30,8 +30,7 @@ from pytensor.tensor import TensorVariable
 from pytensor.xtensor.type import XTensorVariable, as_xtensor
 from pytensor.xtensor.vectorization import vectorize_graph
 
-SWEEP_DIM = "sweep"
-"""Name of the dimension the sweep grid is vectorized over."""
+from pymc_marketing.names.mmm import Dim
 
 SWEEP_NAME = "sweep"
 """Name of the symbolic sweep input every compiled sweep takes."""
@@ -106,7 +105,7 @@ def build_sweep_response(
             raise ValueError(f"Unknown sweep_type {sweep_type!r}")
 
     sweep_response = vectorize_graph(response, replace={base_value: sweep_combinations})
-    return sweep_response.sum(dim="date").transpose("sample", SWEEP_DIM, ...)
+    return sweep_response.sum(dim=Dim.DATE).transpose("sample", Dim.SWEEP, ...)
 
 
 def compose_sweep(
@@ -150,7 +149,7 @@ def compose_sweep(
     """
     if has_mask and mask_shape is None:
         raise ValueError("mask_shape is required when has_mask is true.")
-    sweep = ptx.xtensor(SWEEP_NAME, dims=(SWEEP_DIM,))
+    sweep = ptx.xtensor(SWEEP_NAME, dims=(Dim.SWEEP,))
     inputs: list[Variable] = [sweep]
     if has_mask:
         mask = pt.tensor(MASK_NAME, shape=mask_shape, dtype=bool)
