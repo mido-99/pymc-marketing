@@ -90,6 +90,7 @@ Notes
 
 import math
 import warnings
+from collections.abc import Sequence
 from typing import Literal
 
 import numpy as np
@@ -99,6 +100,7 @@ from pytensor import function
 from xarray import DataArray
 
 from pymc_marketing.mmm.sweep_graph import SWEEP_DIM, compose_sweep
+from pymc_marketing.names.mmm import Dim, Group, Var
 from pymc_marketing.pytensor_utils import (
     SharedPosterior,
     _raise_for_missing_posterior_variables,
@@ -119,6 +121,20 @@ class SensitivityAnalysis:
 
     ``dims`` is accepted for backwards compatibility and ignored: the response's
     own dims decide the output axes.
+
+    Parameters
+    ----------
+    pymc_model : Model
+        The PyMC model whose response is swept.
+    idata : xr.DataTree
+        The inference data holding the model's posterior.
+    dims : tuple of str, default ()
+        Accepted for backwards compatibility and ignored.
+    frozen_deterministics : sequence of str, default ()
+        Deterministics taken from the posterior rather than recomputed, such as a
+        latent path over the dates the model was fitted on. A sweep keeps those
+        dates, so their posterior draws hold in every sweep.
+        :attr:`MMM.frozen_deterministics` lists an MMM's.
     """
 
     def __init__(
@@ -126,7 +142,8 @@ class SensitivityAnalysis:
         pymc_model: Model,
         idata: xr.DataTree,
         dims: tuple[str, ...] = (),
-    ):
+        frozen_deterministics: Sequence[str] = (),
+    ) -> None:
         """Initialize the analysis.
 
         Parameters
@@ -139,10 +156,15 @@ class SensitivityAnalysis:
             Accepted for backwards compatibility and ignored.  The response's
             own dims decide the output axes, so passing the model's extra dims
             here is harmless but unnecessary.
+        frozen_deterministics : sequence of str, default ()
+            Deterministics taken from the posterior rather than recomputed, such
+            as a latent path over the dates the model was fitted on.  A sweep
+            keeps those dates, so their posterior draws hold in every sweep.
         """
         self.model = pymc_model
         self.idata = idata
         self.dims = dims
+        self.frozen_deterministics = tuple(frozen_deterministics)
 
     def _draw_indices_for_percentage(
         self, posterior_sample_fraction: float
@@ -190,13 +212,18 @@ class SensitivityAnalysis:
         """
         posterior = posterior_in_model_coords(idata, self.model.coords)
         _raise_for_missing_posterior_variables(
-            needed_posterior_names(self.model, [self.model[response_variable]]),
+            needed_posterior_names(
+                self.model,
+                [self.model[response_variable]],
+                self.frozen_deterministics,
+            ),
             posterior,
         )
         return extract_response_distribution(
             pymc_model=self.model,
             idata=posterior,
             response_variable=response_variable,
+            frozen_deterministics=list(self.frozen_deterministics),
             shared_posterior=SharedPosterior(),
         )
 
@@ -266,7 +293,7 @@ class SensitivityAnalysis:
         (e.g., 'uplift_curve', 'marginal_effects').
         """
         dataset = xr.Dataset({"x": result})
-        if hasattr(self.idata, "sensitivity_analysis"):
+        if hasattr(self.idata, Group.SENSITIVITY_ANALYSIS):
             warnings.warn(
                 "'sensitivity_analysis' group already exists; updating variable 'x' with new results.",
                 UserWarning,
@@ -280,7 +307,7 @@ class SensitivityAnalysis:
                 # Legacy case: replace DataArray with Dataset for consistency
                 self.idata.sensitivity_analysis = dataset  # type: ignore[attr-defined]
         else:
-            self.idata["/sensitivity_analysis"] = dataset
+            self.idata[f"/{Group.SENSITIVITY_ANALYSIS}"] = dataset
 
     def _selected_idata(
         self, var_names: str, posterior_sample_fraction: float
@@ -300,7 +327,9 @@ class SensitivityAnalysis:
         itself.
         """
         draw_selection = self._draw_indices_for_percentage(posterior_sample_fraction)
-        read_names = needed_posterior_names(self.model, [self.model[var_names]])
+        read_names = needed_posterior_names(
+            self.model, [self.model[var_names]], self.frozen_deterministics
+        )
         posterior = self.idata.posterior.to_dataset()
         if not read_names or any(name not in posterior for name in read_names):
             return self.idata.isel(draw=draw_selection)
@@ -364,7 +393,7 @@ class SensitivityAnalysis:
         var_input: str,
         sweep_values: np.ndarray,
         *,
-        var_names: str = "channel_contribution",
+        var_names: str = Var.CHANNEL_CONTRIBUTION,
         sweep_type: Literal[
             "multiplicative", "additive", "absolute"
         ] = "multiplicative",
@@ -443,7 +472,7 @@ class SensitivityAnalysis:
                 "pmd.Deterministic(..., dims=(...))."
             )
         response_dims = tuple(response_dims)
-        if "date" not in response_dims:
+        if Dim.DATE not in response_dims:
             raise ValueError(
                 f"{var_names!r} has no 'date' dimension. Sensitivity sweeps "
                 "require a response with a 'date' dimension, for example one "
@@ -518,7 +547,7 @@ class SensitivityAnalysis:
 
         xr_result = results_aligned - ref_aligned
         if extend_idata:
-            if not hasattr(self.idata, "sensitivity_analysis"):
+            if not hasattr(self.idata, Group.SENSITIVITY_ANALYSIS):
                 raise ValueError(
                     "No sensitivity analysis results found in 'self.idata'. "
                     "Run 'mmm.sensitivity.run_sweep()' first."
@@ -553,7 +582,7 @@ class SensitivityAnalysis:
         """
         xr_result = results.differentiate(coord=SWEEP_DIM)
         if extend_idata:
-            if not hasattr(self.idata, "sensitivity_analysis"):
+            if not hasattr(self.idata, Group.SENSITIVITY_ANALYSIS):
                 raise ValueError(
                     "No sensitivity analysis results found in 'self.idata'. "
                     "Run 'mmm.sensitivity.run_sweep()' first."
